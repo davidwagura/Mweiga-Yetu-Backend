@@ -3,10 +3,14 @@
 namespace App\Http\Controllers;
 
 use App\Models\Event;
+use App\Helpers\CloudinaryHelper;
+use App\Jobs\UploadEventImages;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Support\Arr;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 
 class EventController extends Controller
@@ -108,15 +112,49 @@ class EventController extends Controller
                 'category_id' => 'required|exists:categories,id',
                 'urgent' => 'required|boolean',
                 'location' => 'required|string',
+                'images' => 'nullable|array',
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp',
             ]);
+
+            $temporaryPaths = [];
+            $imageUrls = [];
+
+            if ($request->hasFile('images')) {
+                foreach ($request->file('images') as $image) {
+                    $storedPath = $image->store('temp/events');
+                    if ($storedPath) {
+                        $temporaryPaths[] = $storedPath;
+                    }
+                }
+            }
 
             $uniqueId = $this->generateEventUniqueId();
 
-            $event = Event::create([
-                'unique_id' => $uniqueId,
-                'user_id' => Auth::id(),
-                ...$validated,
-            ]);
+            $event = Event::create(array_merge(
+                Arr::except($validated, ['images']),
+                [
+                    'unique_id' => $uniqueId,
+                    'user_id' => Auth::id(),
+                    'images' => $imageUrls,
+                ]
+            ));
+
+            if (!empty($temporaryPaths)) {
+                UploadEventImages::dispatch(
+                    $event->id,
+                    $temporaryPaths,
+                    [
+                        'folder' => 'events',
+                        'transformation' => [
+                            'width' => 800,
+                            'height' => 600,
+                            'crop' => 'limit',
+                            'quality' => 'auto',
+                            'format' => 'auto'
+                        ],
+                    ]
+                );
+            }
 
             return $this->respond('Event created successfully', [
                 'event' => $event,
@@ -125,6 +163,14 @@ class EventController extends Controller
             return $this->respond('Validation failed: ' . collect($e->errors())->flatten()->first(), null, 422);
         } catch (\Exception $e) {
             Log::error('Error creating event: ' . $e->getMessage());
+            if (!empty($temporaryPaths)) {
+                foreach ($temporaryPaths as $tempPath) {
+                    try {
+                        Storage::delete($tempPath);
+                    } catch (\Throwable $t) {
+                    }
+                }
+            }
             return $this->respond('Failed to create event', null, 500);
         }
     }
@@ -158,9 +204,61 @@ class EventController extends Controller
                 'category_id' => 'required|exists:categories,id',
                 'urgent' => 'required|boolean',
                 'location' => 'required|string',
+                'images' => 'nullable|array',
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp',
+                'images_to_delete' => 'nullable|array',
             ]);
 
-            $event->update($validated);
+            $currentImages = $event->images ?? [];
+
+            if (!empty($validated['images_to_delete'])) {
+                foreach ($validated['images_to_delete'] as $imageUrl) {
+                    try {
+                        $publicId = $this->extractPublicIdFromUrl($imageUrl);
+                        if ($publicId) {
+                            CloudinaryHelper::destroy($publicId);
+                        }
+                    } catch (\Throwable $e) {
+                        Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
+                    }
+                }
+                $currentImages = array_values(array_diff($currentImages, $validated['images_to_delete']));
+            }
+
+            $imageUrls = $currentImages;
+            $temporaryPaths = [];
+
+            if ($request->hasFile('images')) {
+                foreach ($request->file('images') as $image) {
+                    $storedPath = $image->store('temp/events');
+                    if ($storedPath) {
+                        $temporaryPaths[] = $storedPath;
+                    }
+                }
+            }
+
+            $updateData = Arr::except($validated, ['images', 'images_to_delete']);
+            $updateData['images'] = $imageUrls;
+
+            $event->update($updateData);
+            $event->refresh();
+
+            if (!empty($temporaryPaths)) {
+                UploadEventImages::dispatch(
+                    $event->id,
+                    $temporaryPaths,
+                    [
+                        'folder' => 'events',
+                        'transformation' => [
+                            'width' => 800,
+                            'height' => 600,
+                            'crop' => 'limit',
+                            'quality' => 'auto',
+                            'format' => 'auto'
+                        ],
+                    ]
+                );
+            }
 
             return $this->respond('Event updated successfully', [
                 'event' => $event,
@@ -210,6 +308,18 @@ class EventController extends Controller
     {
         try {
             $event = Event::where('unique_id', $unique_id)->firstOrFail();
+            if (!empty($event->images)) {
+                foreach ($event->images as $image) {
+                    try {
+                        $publicId = $this->extractPublicIdFromUrl($image);
+                        if ($publicId) {
+                            CloudinaryHelper::destroy($publicId);
+                        }
+                    } catch (\Throwable $e) {
+                        Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
+                    }
+                }
+            }
             $event->delete();
 
             return $this->respond('Event deleted successfully', [
@@ -220,6 +330,32 @@ class EventController extends Controller
         } catch (\Exception $e) {
             Log::error('Error deleting event: ' . $e->getMessage());
             return $this->respond('Failed to delete event', null, 500);
+        }
+    }
+
+    private function extractPublicIdFromUrl($url)
+    {
+        try {
+            if (empty($url)) {
+                return null;
+            }
+            $parsedUrl = parse_url($url);
+            $path = $parsedUrl['path'] ?? '';
+            $patterns = [
+                '/\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+                '/\/image\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+                '/\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/'
+            ];
+            foreach ($patterns as $pattern) {
+                if (preg_match($pattern, $path, $matches)) {
+                    return $matches[1];
+                }
+            }
+            Log::warning('Could not extract public_id from URL: ' . $url);
+            return null;
+        } catch (\Throwable $e) {
+            Log::error('Failed to extract public_id from URL: ' . $e->getMessage());
+            return null;
         }
     }
 }

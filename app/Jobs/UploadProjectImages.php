@@ -29,8 +29,8 @@ class UploadProjectImages implements ShouldQueue
         $this->temporaryPaths = $temporaryPaths;
         $this->uploadOptions = $uploadOptions;
 
-        // Specify the queue
-        $this->onQueue('uploads');
+        // Route to the configured database queue (falls back to "default")
+        $this->onQueue(config('queue.connections.database.queue', 'default'));
     }
 
     public function handle()
@@ -73,7 +73,6 @@ class UploadProjectImages implements ShouldQueue
                     // Delete temporary file
                     Storage::delete($tempPath);
                     Log::info("Deleted temporary file: {$tempPath}");
-
                 } catch (\Exception $e) {
                     Log::error("Failed to process image {$tempPath}: " . $e->getMessage());
                 }
@@ -89,7 +88,6 @@ class UploadProjectImages implements ShouldQueue
             }
 
             Log::info("UploadProjectImages job completed successfully for project {$this->projectId}");
-
         } catch (\Exception $e) {
             Log::error("UploadProjectImages job failed: " . $e->getMessage());
             throw $e;

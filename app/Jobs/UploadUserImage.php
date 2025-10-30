@@ -60,7 +60,6 @@ class UploadUserImage implements ShouldQueue
         try {
             $absolutePath = Storage::path($this->temporaryPath);
 
-            // Use CloudinaryHelper to upload using a stream-based method if possible
             $result = CloudinaryHelper::upload($absolutePath, $this->cloudinaryOptions);
 
             if (!empty($result['secure_url'])) {
@@ -72,7 +71,6 @@ class UploadUserImage implements ShouldQueue
         } catch (\Throwable $e) {
             Log::error("UploadUserImage failed for user {$this->userId}: {$e->getMessage()}");
         } finally {
-            // Always attempt to remove temp file
             try {
                 if (Storage::exists($this->temporaryPath)) {
                     Storage::delete($this->temporaryPath);
@@ -83,7 +81,6 @@ class UploadUserImage implements ShouldQueue
             }
         }
 
-        // Free up memory
         gc_collect_cycles();
     }
 }

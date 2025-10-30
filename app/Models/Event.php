@@ -11,12 +11,17 @@ class Event extends Model
         'unique_id',
         'user_id',
         'description',
+        'images',
         'start_dateTime',
         'end_dateTime',
         'category_id',
         'urgent',
         'attending_count',
         'location',
+    ];
+
+    protected $casts = [
+        'images' => 'array',
     ];
 
     public function category()
@@ -33,5 +38,4 @@ class Event extends Model
     {
         return $this->belongsToMany(User::class, 'event_attendees');
     }
-
 }

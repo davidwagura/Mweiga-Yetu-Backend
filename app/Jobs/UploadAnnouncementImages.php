@@ -27,7 +27,7 @@ class UploadAnnouncementImages implements ShouldQueue
         $this->announcementId = $announcementId;
         $this->temporaryPaths = $temporaryPaths;
         $this->uploadOptions = $uploadOptions;
-        $this->onQueue('uploads');
+        $this->onQueue(config('queue.connections.database.queue', 'default'));
     }
 
     public function handle()
@@ -81,7 +81,6 @@ class UploadAnnouncementImages implements ShouldQueue
                     } catch (\Exception $e) {
                         Log::error("Failed to delete temporary file {$tempPath}: " . $e->getMessage());
                     }
-
                 } catch (\Exception $e) {
                     Log::error("Failed to process image {$tempPath}: " . $e->getMessage());
 
@@ -106,7 +105,6 @@ class UploadAnnouncementImages implements ShouldQueue
             }
 
             Log::info("Image upload job completed for announcement {$this->announcementId}. Successful: {$successfulUploads}/" . count($this->temporaryPaths));
-
         } catch (\Exception $e) {
             Log::error("UploadAnnouncementImages job failed for announcement {$this->announcementId}: " . $e->getMessage());
             throw $e;
