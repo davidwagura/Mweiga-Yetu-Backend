@@ -22,6 +22,16 @@ class UploadUserImage implements ShouldQueue
     public $timeout = 180; // 3 minutes
     public $memory = 256; // MB (Laravel 11+)
 
+    /**
+     * The number of times the job may be attempted.
+     */
+    public $tries = 3;
+
+    /**
+     * The number of seconds to wait before retrying the job.
+     */
+    public $backoff = [10, 30, 60];
+
     /** @var int */
     protected $userId;
 
@@ -53,37 +63,103 @@ class UploadUserImage implements ShouldQueue
         $user = User::find($this->userId);
 
         if (!$user) {
-            Log::warning("UploadUserImage: User not found (ID: {$this->userId}).");
+            $this->fail(new \Exception("User not found (ID: {$this->userId})."));
+            return;
+        }
+
+        if (!Storage::exists($this->temporaryPath)) {
+            $this->fail(new \Exception("Temporary file not found: {$this->temporaryPath}"));
             return;
         }
 
         try {
             $absolutePath = Storage::path($this->temporaryPath);
 
-            // Use CloudinaryHelper to upload using a stream-based method if possible
-            $result = CloudinaryHelper::upload($absolutePath, $this->cloudinaryOptions);
+            // Track upload progress and notify user
+            $progressOptions = array_merge($this->cloudinaryOptions, [
+                'notification_url' => route('upload.progress', ['userId' => $this->userId])
+            ]);
+
+            $result = CloudinaryHelper::upload($absolutePath, $progressOptions);
 
             if (!empty($result['secure_url'])) {
+                // Delete old image if exists
+                if ($user->image_path) {
+                    $oldPublicId = $this->extractPublicIdFromUrl($user->image_path);
+                    if ($oldPublicId) {
+                        try {
+                            CloudinaryHelper::destroy($oldPublicId);
+                        } catch (\Throwable $e) {
+                            Log::warning("Failed to delete old image: {$e->getMessage()}");
+                        }
+                    }
+                }
+
                 $user->update(['image_path' => $result['secure_url']]);
-                Log::info("Uploaded user image for {$user->email}: {$result['secure_url']}");
+                Log::info("Successfully uploaded image for user {$user->email}");
+
+                // Notify user of success
+                $user->notify(new ImageUploadSuccessNotification($result['secure_url']));
             } else {
-                Log::warning("UploadUserImage: No secure_url returned for {$this->temporaryPath}");
+                throw new \Exception("No secure_url returned from Cloudinary");
             }
         } catch (\Throwable $e) {
-            Log::error("UploadUserImage failed for user {$this->userId}: {$e->getMessage()}");
+            Log::error("Upload failed for user {$this->userId}: {$e->getMessage()}");
+
+            // Determine if we should retry
+            if ($this->attempts() < $this->tries) {
+                $delay = $this->backoff[$this->attempts() - 1] ?? 60;
+                $this->release($delay);
+                return;
+            }
+
+            // Notify user of failure on final attempt
+            $user->notify(new ImageUploadFailedNotification());
+            throw $e;
         } finally {
-            // Always attempt to remove temp file
-            try {
-                if (Storage::exists($this->temporaryPath)) {
-                    Storage::delete($this->temporaryPath);
-                    Log::info("Temp file deleted: {$this->temporaryPath}");
-                }
-            } catch (\Throwable $e) {
-                Log::warning("Failed to delete temp file {$this->temporaryPath}: {$e->getMessage()}");
+            // Clean up temp file
+            $this->cleanupTemporaryFile();
+        }
+    }
+
+    /**
+     * Clean up the temporary file.
+     */
+    private function cleanupTemporaryFile(): void
+    {
+        try {
+            if (Storage::exists($this->temporaryPath)) {
+                Storage::delete($this->temporaryPath);
+                Log::info("Cleaned up temporary file: {$this->temporaryPath}");
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Failed to cleanup temporary file {$this->temporaryPath}: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * Extract public ID from Cloudinary URL.
+     */
+    private function extractPublicIdFromUrl(?string $url): ?string
+    {
+        if (empty($url)) {
+            return null;
+        }
+
+        $parsedUrl = parse_url($url);
+        $path = $parsedUrl['path'] ?? '';
+
+        $patterns = [
+            '/\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+            '/\/image\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/'
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $path, $matches)) {
+                return $matches[1];
             }
         }
 
-        // Free up memory
-        gc_collect_cycles();
+        return null;
     }
 }

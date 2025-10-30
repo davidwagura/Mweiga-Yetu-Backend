@@ -2,22 +2,21 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
-class Property extends Model
+class Notification extends Model
 {
+    use HasFactory;
+
     protected $fillable = [
-        'name',
-        'number_of_units',
-        'address',
         'user_id',
+        'title',
+        'message',
+        'type',
+        'is_read',
     ];
 
-    public function residents()
-    {
-        return $this->hasMany(Resident::class);
-    }
-    
     public function user()
     {
         return $this->belongsTo(User::class);

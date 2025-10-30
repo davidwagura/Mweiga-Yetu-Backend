@@ -27,4 +27,34 @@ class User extends Authenticatable
         'image_path' => 'string',
     ];
 
+    public function events()
+    {
+        return $this->hasMany(Event::class);
+    }
+
+    public function projects()
+    {
+        return $this->hasMany(Project::class);
+    }
+
+    public function opportunities()
+    {
+        return $this->hasMany(Opportunity::class);
+    }
+
+    public function announcements()
+    {
+        return $this->hasMany(Announcement::class);
+    }
+
+    public function attendingEvents()
+    {
+        return $this->belongsToMany(Event::class, 'event_attendees');
+    }
+
+    public function notifications()
+    {
+        return $this->hasMany(Notification::class);
+    }
+
 }

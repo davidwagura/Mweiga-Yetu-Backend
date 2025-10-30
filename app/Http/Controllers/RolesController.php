@@ -20,7 +20,7 @@ class RolesController extends Controller
         return response()->json([
             'message' => 'User roles updated successfully.',
             'user' => $user->only(['id', 'name', 'email']),
-            'roles' => $user->getRoleNames(), 
+            'roles' => $user->getRoleNames(),
         ], 200);
     }
 }

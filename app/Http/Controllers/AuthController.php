@@ -39,7 +39,6 @@ class AuthController extends Controller
                 'phone_number' => $request->phone_number,
                 'password'     => Hash::make($request->password),
                 'image_path'   => $request->image_path ?? null,
-                'is_active'    => true,
             ]);
 
             $user->assignRole('user');
@@ -292,12 +291,12 @@ class AuthController extends Controller
 
             DB::table('password_reset_tokens')->where('email', $request->email)->delete();
 
-            Notification::create([
-                'user_id' => $user->id,
-                'type'    => 'password_change',
-                'title'   => 'Password Changed',
-                'message' => 'Your account password was changed successfully.',
-            ]);
+            // Notification::create([
+            //     'user_id' => $user->id,
+            //     'type'    => 'password_change',
+            //     'title'   => 'Password Changed',
+            //     'message' => 'Your account password was changed successfully.',
+            // ]);
             return response()->json([
                 'status'  => 'success',
                 'message' => 'Password has been reset successfully',
@@ -396,7 +395,6 @@ class AuthController extends Controller
                 'name'            => 'sometimes|string|max:255',
                 'email'           => 'sometimes|email|unique:users,email,' . $user->id,
                 'phone_number'    => 'sometimes|string|unique:users,phone_number,' . $user->id,
-                'whatsApp_number' => 'sometimes|string|nullable',
                 'image'           => 'nullable|image|mimes:jpeg,png,jpg,gif,webp',
                 'delete_image'    => 'nullable|string|in:true,false',
             ]);
@@ -427,15 +425,14 @@ class AuthController extends Controller
             $user->name            = $request->input('name', $user->name);
             $user->email           = $request->input('email', $user->email);
             $user->phone_number    = $request->input('phone_number', $user->phone_number);
-            $user->whatsApp_number = $request->input('whatsApp_number', $user->whatsApp_number);
             $user->save();
 
-            Notification::create([
-                'user_id' => $user->id,
-                'type'    => 'profile_update',
-                'title'   => 'Profile Updated',
-                'message' => 'Your profile information was updated successfully.',
-            ]);
+            // Notification::create([
+            //     'user_id' => $user->id,
+            //     'type'    => 'profile_update',
+            //     'title'   => 'Profile Updated',
+            //     'message' => 'Your profile information was updated successfully.',
+            // ]);
 
             return response()->json([
                 'status'  => 'success',
@@ -491,10 +488,10 @@ class AuthController extends Controller
         }
     }
 
-    public function getUserDataByEmail($email)
+    public function getUserDataByEmail(Request $request, $email)
     {
         try {
-            $user = User::where('email', $email)->first();
+            $user = User::where('email', $request->email)->first();
 
             if (!$user) {
                 return response()->json([
@@ -504,13 +501,20 @@ class AuthController extends Controller
                 ], 404);
             }
 
-            $user->setHidden(['roles', 'permissions']);
+            // Log in the user without a password
+            Auth::login($user);
+
+            // Generate a token (optional, if you’re using Sanctum)
+            $token = $user->createToken('auth_token')->plainTextToken;
 
             return response()->json([
                 'status'  => 'success',
-                'message' => 'User fetched successfully',
+                'message' => 'User logged in successfully',
                 'code'    => 200,
-                'data'    => $user,
+                'data'    => [
+                    'user'  => $user,
+                    'token' => $token,
+                ],
             ], 200);
         } catch (\Exception $e) {
             return response()->json([
