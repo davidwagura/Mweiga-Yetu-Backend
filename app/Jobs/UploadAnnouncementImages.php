@@ -2,8 +2,8 @@
 
 namespace App\Jobs;
 
-use App\Helpers\CloudinaryHelper;
 use App\Models\Announcement;
+use App\Helpers\CloudinaryHelper;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -16,136 +16,116 @@ class UploadAnnouncementImages implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /**
-     * Increase timeout and memory allowance for large uploads.
-     */
-    public $timeout = 300; // seconds (5 minutes)
-    public $tries = 3; // Number of retry attempts
+    public $timeout = 120;
 
-    /** @var int */
     protected $announcementId;
-
-    /** @var array */
     protected $temporaryPaths;
+    protected $uploadOptions;
 
-    /** @var array */
-    protected $cloudinaryOptions;
-
-    /**
-     * @param int $announcementId
-     * @param array $temporaryPaths Array with path and filename
-     * @param array $cloudinaryOptions
-     */
-    public function __construct($announcementId, array $temporaryPaths, array $cloudinaryOptions = [])
+    public function __construct($announcementId, $temporaryPaths, $uploadOptions = [])
     {
         $this->announcementId = $announcementId;
         $this->temporaryPaths = $temporaryPaths;
-        $this->cloudinaryOptions = $cloudinaryOptions;
+        $this->uploadOptions = $uploadOptions;
+        $this->onQueue('uploads');
     }
 
-    public function handle(): void
-    {
-        $announcement = Announcement::find($this->announcementId);
-
-        if (!$announcement) {
-            Log::warning("Announcement not found for image upload (ID: {$this->announcementId}).");
-            $this->cleanupTemporaryFiles();
-            return;
-        }
-
-        Log::info("Starting image upload for announcement {$this->announcementId} with " . count($this->temporaryPaths) . " images");
-
-        $uploadedUrls = [];
-
-        foreach ($this->temporaryPaths as $tempFile) {
-            try {
-                $filePath = $tempFile['path'];
-
-                // Check if file exists and is readable
-                if (!Storage::disk('public')->exists($filePath)) {
-                    Log::error("Temporary file not found: {$filePath}");
-                    continue;
-                }
-
-                // Get absolute path for Cloudinary upload
-                $absolutePath = Storage::disk('public')->path($filePath);
-
-                // Upload to Cloudinary with options
-                $result = CloudinaryHelper::upload($absolutePath, $this->cloudinaryOptions);
-
-                if (isset($result['secure_url'])) {
-                    $uploadedUrls[] = $result['secure_url'];
-                    Log::info("Successfully uploaded image for announcement {$this->announcementId}: {$result['secure_url']}");
-                } else {
-                    Log::error("Cloudinary upload failed - no secure_url in response for file: {$filePath}");
-                }
-
-            } catch (\Throwable $e) {
-                Log::error("Cloudinary upload failed for {$tempFile['path']}: {$e->getMessage()}");
-                // Continue with other files even if one fails
-            } finally {
-                // Always cleanup temp file
-                $this->deleteTemporaryFile($tempFile['path']);
-            }
-        }
-
-        // Update announcement with new image URLs
-        if (!empty($uploadedUrls)) {
-            try {
-                $currentImages = is_array($announcement->images) ? $announcement->images : [];
-                $updatedImages = array_values(array_unique(array_merge($currentImages, $uploadedUrls)));
-
-                $announcement->update([
-                    'images' => $updatedImages,
-                ]);
-
-                Log::info("Successfully updated announcement {$this->announcementId} with " . count($uploadedUrls) . " new images. Total images: " . count($updatedImages));
-            } catch (\Throwable $e) {
-                Log::error("Failed to update announcement images in database: {$e->getMessage()}");
-            }
-        } else {
-            Log::warning("No images were successfully uploaded for announcement {$this->announcementId}");
-        }
-
-        // Release memory
-        unset($uploadedUrls);
-        gc_collect_cycles();
-    }
-
-    /**
-     * Handle job failure
-     */
-    public function failed(\Throwable $exception): void
-    {
-        Log::error("UploadAnnouncementImages job failed for announcement {$this->announcementId}: {$exception->getMessage()}");
-        Log::error("Stack trace: {$exception->getTraceAsString()}");
-
-        // Clean up temporary files even if job fails
-        $this->cleanupTemporaryFiles();
-    }
-
-    /**
-     * Delete a single temporary file
-     */
-    protected function deleteTemporaryFile(string $path): void
+    public function handle()
     {
         try {
-            if (Storage::disk('public')->exists($path)) {
-                Storage::disk('public')->delete($path);
-                Log::info("Cleaned up temporary file: {$path}");
+            Log::info("Starting image upload for announcement {$this->announcementId} with " . count($this->temporaryPaths) . " images");
+
+            $announcement = Announcement::find($this->announcementId);
+
+            if (!$announcement) {
+                Log::error("Announcement not found with ID: {$this->announcementId}");
+                return;
             }
-        } catch (\Throwable $e) {
-            Log::warning("Failed to cleanup temp file {$path}: {$e->getMessage()}");
+
+            $uploadedUrls = [];
+            $successfulUploads = 0;
+
+            foreach ($this->temporaryPaths as $tempPath) {
+                try {
+                    Log::info("Processing temporary file: {$tempPath}");
+
+                    // Check if file exists
+                    if (!Storage::exists($tempPath)) {
+                        Log::error("Temporary file not found: {$tempPath}");
+                        continue;
+                    }
+
+                    // Get the full path
+                    $fullPath = Storage::path($tempPath);
+
+                    if (!file_exists($fullPath)) {
+                        Log::error("File does not exist at path: {$fullPath}");
+                        continue;
+                    }
+
+                    // Upload to Cloudinary
+                    $uploadResult = CloudinaryHelper::upload($fullPath, $this->uploadOptions);
+
+                    if ($uploadResult && isset($uploadResult['secure_url'])) {
+                        $uploadedUrls[] = $uploadResult['secure_url'];
+                        $successfulUploads++;
+                        Log::info("Successfully uploaded image: {$uploadResult['secure_url']}");
+                    } else {
+                        Log::error("Cloudinary upload failed for: {$tempPath}");
+                    }
+
+                    // Delete temporary file regardless of upload success
+                    try {
+                        Storage::delete($tempPath);
+                        Log::info("Deleted temporary file: {$tempPath}");
+                    } catch (\Exception $e) {
+                        Log::error("Failed to delete temporary file {$tempPath}: " . $e->getMessage());
+                    }
+
+                } catch (\Exception $e) {
+                    Log::error("Failed to process image {$tempPath}: " . $e->getMessage());
+
+                    // Clean up temporary file on error
+                    try {
+                        if (Storage::exists($tempPath)) {
+                            Storage::delete($tempPath);
+                        }
+                    } catch (\Exception $deleteException) {
+                        Log::error("Failed to cleanup temp file {$tempPath}: " . $deleteException->getMessage());
+                    }
+                }
+            }
+
+            // Update announcement with new images
+            if (!empty($uploadedUrls)) {
+                $currentImages = $announcement->images ?? [];
+                $updatedImages = array_merge($currentImages, $uploadedUrls);
+
+                $announcement->update(['images' => $updatedImages]);
+                Log::info("Successfully updated announcement {$this->announcementId} with " . count($uploadedUrls) . " new images");
+            }
+
+            Log::info("Image upload job completed for announcement {$this->announcementId}. Successful: {$successfulUploads}/" . count($this->temporaryPaths));
+
+        } catch (\Exception $e) {
+            Log::error("UploadAnnouncementImages job failed for announcement {$this->announcementId}: " . $e->getMessage());
+            throw $e;
         }
     }
 
-    /**
-     * Clean up all temporary files
-     */
-    protected function cleanupTemporaryFiles(): void
+    public function failed(\Exception $exception)
     {
-        foreach ($this->temporaryPaths as $tempFile) {
-            $this->deleteTemporaryFile($tempFile['path']);
+        Log::error("UploadAnnouncementImages job failed completely for announcement {$this->announcementId}: " . $exception->getMessage());
+
+        // Clean up any remaining temporary files
+        foreach ($this->temporaryPaths as $tempPath) {
+            try {
+                if (Storage::exists($tempPath)) {
+                    Storage::delete($tempPath);
+                }
+            } catch (\Exception $e) {
+                Log::error("Failed to cleanup temp file in failed method: " . $e->getMessage());
+            }
         }
     }
 }

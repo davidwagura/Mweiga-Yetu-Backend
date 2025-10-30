@@ -105,43 +105,34 @@ class AnnouncementController extends Controller
                 'date' => 'required|date',
                 'urgent' => 'boolean',
                 'images' => 'nullable|array',
-                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp|max:10240', // 10MB max
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp|max:10240',
             ]);
 
-            $temporaryPaths = [];
             $imageUrls = [];
+            $temporaryPaths = [];
 
-            // Store files temporarily with proper disk configuration
+            // Store files temporarily - match PropertyController pattern
             if ($request->hasFile('images')) {
                 foreach ($request->file('images') as $image) {
-                    $filename = Str::random(20) . '_' . time() . '.' . $image->getClientOriginalExtension();
-                    $storedPath = $image->storeAs('temp/announcements', $filename, 'public');
-
+                    $storedPath = $image->store('temp/announcements');
                     if ($storedPath) {
-                        $temporaryPaths[] = [
-                            'path' => $storedPath,
-                            'filename' => $filename
-                        ];
-                    } else {
-                        Log::error('Failed to store temporary file: ' . $image->getClientOriginalName());
+                        $temporaryPaths[] = $storedPath;
                     }
                 }
             }
 
             $uniqueId = $this->generateAnnouncementUniqueId();
 
-            // Create announcement with empty images array initially
-            $announcement = Auth::user()->announcements()->create([
-                'unique_id' => $uniqueId,
-                'title' => $validated['title'],
-                'description' => $validated['description'],
-                'category_id' => $validated['category_id'],
-                'date' => $validated['date'],
-                'urgent' => $validated['urgent'] ?? false,
-                'images' => $imageUrls, // Start with empty array
-            ]);
+            // Create announcement with empty images array initially - match PropertyController
+            $announcement = Auth::user()->announcements()->create(array_merge(
+                Arr::except($validated, ['images']),
+                [
+                    'unique_id' => $uniqueId,
+                    'images' => $imageUrls,
+                ]
+            ));
 
-            // Dispatch image upload job if there are images
+            // Dispatch image upload job - match PropertyController pattern exactly
             if (!empty($temporaryPaths)) {
                 UploadAnnouncementImages::dispatch(
                     $announcement->id,
@@ -156,27 +147,28 @@ class AnnouncementController extends Controller
                             'format' => 'auto'
                         ],
                     ]
-                )->onQueue('uploads');
-
-                Log::info("Dispatched image upload job for announcement {$announcement->id} with " . count($temporaryPaths) . " images");
+                );
             }
 
             $announcement->refresh();
 
             return $this->respond('Announcement created successfully', [
                 'announcement' => $announcement->load(['category', 'user']),
-                'images_processing' => !empty($temporaryPaths),
             ], 201);
         } catch (\Illuminate\Validation\ValidationException $e) {
-            return $this->respond('Validation failed: ' . collect($e->errors())->flatten()->first(), null, 422);
+            return $this->respond(
+                'Validation failed: ' . collect($e->errors())->flatten()->first(),
+                null,
+                422
+            );
         } catch (\Exception $e) {
             Log::error('Announcement creation failed: ' . $e->getMessage());
 
             // Clean up any temporary files if creation fails
             if (!empty($temporaryPaths)) {
-                foreach ($temporaryPaths as $tempFile) {
+                foreach ($temporaryPaths as $tempPath) {
                     try {
-                        Storage::disk('public')->delete($tempFile['path']);
+                        Storage::delete($tempPath);
                     } catch (\Exception $deleteException) {
                         Log::error('Failed to cleanup temp file: ' . $deleteException->getMessage());
                     }
@@ -209,44 +201,43 @@ class AnnouncementController extends Controller
 
             $currentImages = $announcement->images ?? [];
 
-            // Handle image deletion
+            // Handle image deletion - match PropertyController pattern
             if (!empty($validated['images_to_delete'])) {
                 foreach ($validated['images_to_delete'] as $imageUrl) {
                     try {
                         $publicId = $this->extractPublicIdFromUrl($imageUrl);
                         if ($publicId) {
                             CloudinaryHelper::destroy($publicId);
-                            Log::info("Deleted image from Cloudinary: {$publicId}");
                         }
                     } catch (\Exception $e) {
                         Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
+                        continue;
                     }
                 }
+
                 $currentImages = array_values(array_diff($currentImages, $validated['images_to_delete']));
             }
 
-            // Handle new image uploads
+            $imageUrls = $currentImages;
             $temporaryPaths = [];
+
+            // Handle new image uploads - match PropertyController pattern
             if ($request->hasFile('images')) {
                 foreach ($request->file('images') as $image) {
-                    $filename = Str::random(20) . '_' . time() . '.' . $image->getClientOriginalExtension();
-                    $storedPath = $image->storeAs('temp/announcements', $filename, 'public');
-
+                    $storedPath = $image->store('temp/announcements');
                     if ($storedPath) {
-                        $temporaryPaths[] = [
-                            'path' => $storedPath,
-                            'filename' => $filename
-                        ];
+                        $temporaryPaths[] = $storedPath;
                     }
                 }
             }
 
             $updateData = Arr::except($validated, ['images', 'images_to_delete']);
-            $updateData['images'] = $currentImages;
+            $updateData['images'] = $imageUrls;
 
             $announcement->update($updateData);
+            $announcement->refresh();
 
-            // Dispatch job for new images
+            // Dispatch job for new images - match PropertyController pattern
             if (!empty($temporaryPaths)) {
                 UploadAnnouncementImages::dispatch(
                     $announcement->id,
@@ -261,21 +252,20 @@ class AnnouncementController extends Controller
                             'format' => 'auto'
                         ],
                     ]
-                )->onQueue('uploads');
-
-                Log::info("Dispatched image upload job for announcement update {$announcement->id} with " . count($temporaryPaths) . " new images");
+                );
             }
-
-            $announcement->refresh();
 
             return $this->respond('Announcement updated successfully', [
                 'announcement' => $announcement->load(['category', 'user']),
-                'images_processing' => !empty($temporaryPaths),
             ]);
         } catch (ModelNotFoundException $e) {
             return $this->respond('Announcement not found', null, 404);
         } catch (\Illuminate\Validation\ValidationException $e) {
-            return $this->respond('Validation failed: ' . collect($e->errors())->flatten()->first(), null, 422);
+            return $this->respond(
+                'Validation failed: ' . collect($e->errors())->flatten()->first(),
+                null,
+                422
+            );
         } catch (\Exception $e) {
             Log::error('Announcement update failed: ' . $e->getMessage());
             return $this->respond('Failed to update announcement: ' . $e->getMessage(), null, 500);
@@ -352,14 +342,13 @@ class AnnouncementController extends Controller
                 return $this->respond('Unauthorized to delete this announcement', null, 403);
             }
 
-            // Delete images from Cloudinary
+            // Delete images from Cloudinary - match PropertyController pattern
             if (!empty($announcement->images)) {
                 foreach ($announcement->images as $image) {
                     try {
                         $publicId = $this->extractPublicIdFromUrl($image);
                         if ($publicId) {
                             CloudinaryHelper::destroy($publicId);
-                            Log::info("Deleted image from Cloudinary during announcement deletion: {$publicId}");
                         }
                     } catch (\Exception $e) {
                         Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
@@ -387,36 +376,18 @@ class AnnouncementController extends Controller
                 return null;
             }
 
-            // Parse URL and extract path
             $parsedUrl = parse_url($url);
             $path = $parsedUrl['path'] ?? '';
 
-            // Remove leading slash
-            $path = ltrim($path, '/');
-
-            // Cloudinary URL patterns
             $patterns = [
-                // Standard format: https://res.cloudinary.com/cloudname/image/upload/v1234567/folder/filename.jpg
-                '@/image/upload/(?:v\d+/)?(.+?)\.(jpg|jpeg|png|gif|webp)$@i',
-
-                // Alternative format: https://res.cloudinary.com/cloudname/image/upload/folder/filename.jpg
-                '@/upload/(?:v\d+/)?(.+?)\.(jpg|jpeg|png|gif|webp)$@i',
-
-                // Direct format: https://res.cloudinary.com/cloudname/folder/filename.jpg
-                '@^(?:image/upload/)?(?:v\d+/)?(.+?)\.(jpg|jpeg|png|gif|webp)$@i'
+                '/\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+                '/\/image\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+                '/\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/'
             ];
 
             foreach ($patterns as $pattern) {
                 if (preg_match($pattern, $path, $matches)) {
-                    $publicId = $matches[1];
-
-                    // Remove any transformation parts if present
-                    if (strpos($publicId, '/') !== false) {
-                        $parts = explode('/', $publicId);
-                        $publicId = end($parts);
-                    }
-
-                    return $publicId;
+                    return $matches[1];
                 }
             }
 

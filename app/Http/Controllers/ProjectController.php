@@ -8,6 +8,7 @@ use App\Jobs\UploadProjectImages;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Support\Arr;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
@@ -88,7 +89,7 @@ class ProjectController extends Controller
             ]);
         } catch (\Exception $e) {
             Log::error('Failed to fetch projects: ' . $e->getMessage());
-            return $this->respond('Failed to fetch projects', null, 500);
+            return $this->respond("Failed to fetch projects: {$e->getMessage()}", null, 500);
         }
     }
 
@@ -106,46 +107,77 @@ class ProjectController extends Controller
                 'start_date' => 'required|date',
                 'status_id' => 'required|exists:statuses,id',
                 'images' => 'nullable|array',
-                'images.*' => 'image|mimes:jpeg,png,jpg,gif',
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp',
             ]);
 
+            $imageUrls = [];
             $temporaryPaths = [];
 
+            // Match PropertyController pattern for temp storage
             if ($request->hasFile('images')) {
                 foreach ($request->file('images') as $image) {
                     $storedPath = $image->store('temp/projects');
-                    if ($storedPath) $temporaryPaths[] = $storedPath;
+                    if ($storedPath) {
+                        $temporaryPaths[] = $storedPath;
+                    }
                 }
             }
 
             $uniqueId = $this->generateProjectUniqueId();
 
-            $project = Auth::user()->projects()->create([
-                'unique_id' => $uniqueId,
-                'title' => $validated['title'],
-                'description' => $validated['description'],
-                'progress_percentage' => $validated['progress_percentage'],
-                'timeline' => $validated['timeline'],
-                'budget' => $validated['budget'],
-                'beneficiaries' => $validated['beneficiaries'],
-                'location' => $validated['location'],
-                'start_date' => $validated['start_date'],
-                'status_id' => $validated['status_id'],
-                'images' => [],
-            ]);
+            // Create project with empty images array - match PropertyController
+            $project = Auth::user()->projects()->create(array_merge(
+                Arr::except($validated, ['images']),
+                [
+                    'unique_id' => $uniqueId,
+                    'images' => $imageUrls,
+                ]
+            ));
 
+            // Dispatch image upload job - match PropertyController pattern
             if (!empty($temporaryPaths)) {
-                UploadProjectImages::dispatch($project, $temporaryPaths);
+                UploadProjectImages::dispatch(
+                    $project->id,
+                    $temporaryPaths,
+                    [
+                        'folder' => 'projects',
+                        'transformation' => [
+                            'width' => 800,
+                            'height' => 600,
+                            'crop' => 'limit',
+                            'quality' => 'auto',
+                            'format' => 'auto'
+                        ],
+                    ]
+                );
             }
 
             $project->refresh();
 
-            return $this->respond('Project created successfully', ['project' => $project], 201);
+            return $this->respond('Project created successfully', [
+                'project' => $project->load('status'),
+            ], 201);
         } catch (\Illuminate\Validation\ValidationException $e) {
-            return $this->respond('Validation failed: ' . collect($e->errors())->flatten()->first(), null, 422);
+            return $this->respond(
+                'Validation failed: ' . collect($e->errors())->flatten()->first(),
+                null,
+                422
+            );
         } catch (\Exception $e) {
             Log::error('Project creation failed: ' . $e->getMessage());
-            return $this->respond('Failed to create project', null, 500);
+
+            // Clean up temporary files
+            if (!empty($temporaryPaths)) {
+                foreach ($temporaryPaths as $tempPath) {
+                    try {
+                        Storage::delete($tempPath);
+                    } catch (\Exception $deleteException) {
+                        Log::error('Failed to cleanup temp file: ' . $deleteException->getMessage());
+                    }
+                }
+            }
+
+            return $this->respond("Failed to create project: {$e->getMessage()}", null, 500);
         }
     }
 
@@ -169,50 +201,80 @@ class ProjectController extends Controller
                 'start_date' => 'required|date',
                 'status_id' => 'required|exists:statuses,id',
                 'images' => 'nullable|array',
-                'images.*' => 'image|mimes:jpeg,png,jpg,gif',
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp',
                 'images_to_delete' => 'nullable|array',
             ]);
 
             $currentImages = $project->images ?? [];
 
+            // Handle image deletion - match PropertyController pattern
             if (!empty($validated['images_to_delete'])) {
                 foreach ($validated['images_to_delete'] as $imageUrl) {
                     try {
-                        CloudinaryHelper::deleteImage($imageUrl);
+                        $publicId = $this->extractPublicIdFromUrl($imageUrl);
+                        if ($publicId) {
+                            CloudinaryHelper::destroy($publicId);
+                        }
                     } catch (\Exception $e) {
-                        Log::error('Failed to delete image: ' . $e->getMessage());
+                        Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
+                        continue;
                     }
                 }
+
                 $currentImages = array_values(array_diff($currentImages, $validated['images_to_delete']));
             }
 
+            $imageUrls = $currentImages;
             $temporaryPaths = [];
+
+            // Handle new image uploads - match PropertyController pattern
             if ($request->hasFile('images')) {
                 foreach ($request->file('images') as $image) {
                     $storedPath = $image->store('temp/projects');
-                    if ($storedPath) $temporaryPaths[] = $storedPath;
+                    if ($storedPath) {
+                        $temporaryPaths[] = $storedPath;
+                    }
                 }
             }
 
             $updateData = Arr::except($validated, ['images', 'images_to_delete']);
-            $updateData['images'] = $currentImages;
+            $updateData['images'] = $imageUrls;
 
             $project->update($updateData);
-
-            if (!empty($temporaryPaths)) {
-                UploadProjectImages::dispatch($project, $temporaryPaths);
-            }
-
             $project->refresh();
 
-            return $this->respond('Project updated successfully', ['project' => $project]);
+            // Dispatch job for new images - match PropertyController pattern
+            if (!empty($temporaryPaths)) {
+                UploadProjectImages::dispatch(
+                    $project->id,
+                    $temporaryPaths,
+                    [
+                        'folder' => 'projects',
+                        'transformation' => [
+                            'width' => 800,
+                            'height' => 600,
+                            'crop' => 'limit',
+                            'quality' => 'auto',
+                            'format' => 'auto'
+                        ],
+                    ]
+                );
+            }
+
+            return $this->respond('Project updated successfully', [
+                'project' => $project->load('status'),
+            ]);
         } catch (ModelNotFoundException $e) {
             return $this->respond('Project not found', null, 404);
         } catch (\Illuminate\Validation\ValidationException $e) {
-            return $this->respond('Validation failed: ' . collect($e->errors())->flatten()->first(), null, 422);
+            return $this->respond(
+                'Validation failed: ' . collect($e->errors())->flatten()->first(),
+                null,
+                422
+            );
         } catch (\Exception $e) {
             Log::error('Project update failed: ' . $e->getMessage());
-            return $this->respond('Failed to update project', null, 500);
+            return $this->respond("Failed to update project: {$e->getMessage()}", null, 500);
         }
     }
 
@@ -225,7 +287,7 @@ class ProjectController extends Controller
             return $this->respond("Project not found with ID: {$unique_id}", null, 404);
         } catch (\Exception $e) {
             Log::error('Failed to fetch project: ' . $e->getMessage());
-            return $this->respond('Failed to fetch project', null, 500);
+            return $this->respond("Failed to fetch project: {$e->getMessage()}", null, 500);
         }
     }
 
@@ -271,7 +333,7 @@ class ProjectController extends Controller
             ]);
         } catch (\Exception $e) {
             Log::error('Failed to fetch user projects: ' . $e->getMessage());
-            return $this->respond('Failed to fetch user projects', null, 500);
+            return $this->respond("Failed to fetch user projects: {$e->getMessage()}", null, 500);
         }
     }
 
@@ -284,12 +346,16 @@ class ProjectController extends Controller
                 return $this->respond('Unauthorized to delete this project', null, 403);
             }
 
+            // Delete images from Cloudinary - match PropertyController pattern
             if (!empty($project->images)) {
                 foreach ($project->images as $image) {
                     try {
-                        CloudinaryHelper::deleteImage($image);
+                        $publicId = $this->extractPublicIdFromUrl($image);
+                        if ($publicId) {
+                            CloudinaryHelper::destroy($publicId);
+                        }
                     } catch (\Exception $e) {
-                        Log::error('Failed to delete image: ' . $e->getMessage());
+                        Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
                     }
                 }
             }
@@ -301,7 +367,7 @@ class ProjectController extends Controller
             return $this->respond('Project not found', null, 404);
         } catch (\Exception $e) {
             Log::error('Failed to delete project: ' . $e->getMessage());
-            return $this->respond('Failed to delete project', null, 500);
+            return $this->respond("Failed to delete project: {$e->getMessage()}", null, 500);
         }
     }
 
@@ -334,5 +400,4 @@ class ProjectController extends Controller
             return null;
         }
     }
-
 }
