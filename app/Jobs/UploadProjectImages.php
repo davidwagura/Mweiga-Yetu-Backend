@@ -9,6 +9,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 class UploadProjectImages implements ShouldQueue
@@ -36,15 +37,15 @@ class UploadProjectImages implements ShouldQueue
                 // Upload to Cloudinary
                 $result = CloudinaryHelper::uploadImage($path, 'projects');
 
-                if ($result) {
-                    $uploadedImages[] = $result;
+                if (is_array($result) && isset($result['secure_url'])) {
+                    $uploadedImages[] = $result['secure_url'];
                 }
 
                 // Clean up the temporary file
                 Storage::disk('public')->delete($image);
             } catch (\Exception $e) {
                 // Log error but continue with other images
-                \Log::error('Error uploading project image: ' . $e->getMessage());
+                Log::error('Error uploading project image: ' . $e->getMessage());
             }
         }
 

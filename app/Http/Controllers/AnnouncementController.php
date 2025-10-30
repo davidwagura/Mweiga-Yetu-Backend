@@ -105,23 +105,32 @@ class AnnouncementController extends Controller
                 'date' => 'required|date',
                 'urgent' => 'boolean',
                 'images' => 'nullable|array',
-                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp',
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp|max:10240', // 10MB max
             ]);
 
             $temporaryPaths = [];
             $imageUrls = [];
 
+            // Store files temporarily with proper disk configuration
             if ($request->hasFile('images')) {
                 foreach ($request->file('images') as $image) {
-                    $storedPath = $image->store('temp/announcements');
+                    $filename = Str::random(20) . '_' . time() . '.' . $image->getClientOriginalExtension();
+                    $storedPath = $image->storeAs('temp/announcements', $filename, 'public');
+
                     if ($storedPath) {
-                        $temporaryPaths[] = $storedPath;
+                        $temporaryPaths[] = [
+                            'path' => $storedPath,
+                            'filename' => $filename
+                        ];
+                    } else {
+                        Log::error('Failed to store temporary file: ' . $image->getClientOriginalName());
                     }
                 }
             }
 
             $uniqueId = $this->generateAnnouncementUniqueId();
 
+            // Create announcement with empty images array initially
             $announcement = Auth::user()->announcements()->create([
                 'unique_id' => $uniqueId,
                 'title' => $validated['title'],
@@ -129,9 +138,10 @@ class AnnouncementController extends Controller
                 'category_id' => $validated['category_id'],
                 'date' => $validated['date'],
                 'urgent' => $validated['urgent'] ?? false,
-                'images' => $imageUrls,
+                'images' => $imageUrls, // Start with empty array
             ]);
 
+            // Dispatch image upload job if there are images
             if (!empty($temporaryPaths)) {
                 UploadAnnouncementImages::dispatch(
                     $announcement->id,
@@ -142,20 +152,37 @@ class AnnouncementController extends Controller
                             'width' => 800,
                             'height' => 600,
                             'crop' => 'limit',
+                            'quality' => 'auto',
+                            'format' => 'auto'
                         ],
                     ]
                 )->onQueue('uploads');
+
+                Log::info("Dispatched image upload job for announcement {$announcement->id} with " . count($temporaryPaths) . " images");
             }
 
             $announcement->refresh();
 
             return $this->respond('Announcement created successfully', [
                 'announcement' => $announcement->load(['category', 'user']),
+                'images_processing' => !empty($temporaryPaths),
             ], 201);
         } catch (\Illuminate\Validation\ValidationException $e) {
             return $this->respond('Validation failed: ' . collect($e->errors())->flatten()->first(), null, 422);
         } catch (\Exception $e) {
             Log::error('Announcement creation failed: ' . $e->getMessage());
+
+            // Clean up any temporary files if creation fails
+            if (!empty($temporaryPaths)) {
+                foreach ($temporaryPaths as $tempFile) {
+                    try {
+                        Storage::disk('public')->delete($tempFile['path']);
+                    } catch (\Exception $deleteException) {
+                        Log::error('Failed to cleanup temp file: ' . $deleteException->getMessage());
+                    }
+                }
+            }
+
             return $this->respond('Failed to create announcement: ' . $e->getMessage(), null, 500);
         }
     }
@@ -176,32 +203,40 @@ class AnnouncementController extends Controller
                 'date' => 'required|date',
                 'urgent' => 'boolean',
                 'images' => 'nullable|array',
-                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp',
+                'images.*' => 'image|mimes:jpeg,png,jpg,gif,webp|max:10240',
                 'images_to_delete' => 'nullable|array',
             ]);
 
             $currentImages = $announcement->images ?? [];
 
+            // Handle image deletion
             if (!empty($validated['images_to_delete'])) {
                 foreach ($validated['images_to_delete'] as $imageUrl) {
                     try {
                         $publicId = $this->extractPublicIdFromUrl($imageUrl);
                         if ($publicId) {
                             CloudinaryHelper::destroy($publicId);
+                            Log::info("Deleted image from Cloudinary: {$publicId}");
                         }
                     } catch (\Exception $e) {
-                        Log::error('Failed to delete image: ' . $e->getMessage());
+                        Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
                     }
                 }
                 $currentImages = array_values(array_diff($currentImages, $validated['images_to_delete']));
             }
 
+            // Handle new image uploads
             $temporaryPaths = [];
             if ($request->hasFile('images')) {
                 foreach ($request->file('images') as $image) {
-                    $storedPath = $image->store('temp/announcements');
+                    $filename = Str::random(20) . '_' . time() . '.' . $image->getClientOriginalExtension();
+                    $storedPath = $image->storeAs('temp/announcements', $filename, 'public');
+
                     if ($storedPath) {
-                        $temporaryPaths[] = $storedPath;
+                        $temporaryPaths[] = [
+                            'path' => $storedPath,
+                            'filename' => $filename
+                        ];
                     }
                 }
             }
@@ -211,6 +246,7 @@ class AnnouncementController extends Controller
 
             $announcement->update($updateData);
 
+            // Dispatch job for new images
             if (!empty($temporaryPaths)) {
                 UploadAnnouncementImages::dispatch(
                     $announcement->id,
@@ -221,15 +257,20 @@ class AnnouncementController extends Controller
                             'width' => 800,
                             'height' => 600,
                             'crop' => 'limit',
+                            'quality' => 'auto',
+                            'format' => 'auto'
                         ],
                     ]
                 )->onQueue('uploads');
+
+                Log::info("Dispatched image upload job for announcement update {$announcement->id} with " . count($temporaryPaths) . " new images");
             }
 
             $announcement->refresh();
 
             return $this->respond('Announcement updated successfully', [
                 'announcement' => $announcement->load(['category', 'user']),
+                'images_processing' => !empty($temporaryPaths),
             ]);
         } catch (ModelNotFoundException $e) {
             return $this->respond('Announcement not found', null, 404);
@@ -311,15 +352,17 @@ class AnnouncementController extends Controller
                 return $this->respond('Unauthorized to delete this announcement', null, 403);
             }
 
+            // Delete images from Cloudinary
             if (!empty($announcement->images)) {
                 foreach ($announcement->images as $image) {
                     try {
                         $publicId = $this->extractPublicIdFromUrl($image);
                         if ($publicId) {
                             CloudinaryHelper::destroy($publicId);
+                            Log::info("Deleted image from Cloudinary during announcement deletion: {$publicId}");
                         }
                     } catch (\Exception $e) {
-                        Log::error('Failed to delete image: ' . $e->getMessage());
+                        Log::error('Failed to delete image from Cloudinary: ' . $e->getMessage());
                     }
                 }
             }
@@ -340,16 +383,47 @@ class AnnouncementController extends Controller
     private function extractPublicIdFromUrl($url)
     {
         try {
-            if (!$url) return null;
-            $parsed = parse_url($url);
-            $path = $parsed['path'] ?? '';
-
-            if (preg_match('/\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/', $path, $matches)) {
-                return $matches[1];
+            if (empty($url)) {
+                return null;
             }
+
+            // Parse URL and extract path
+            $parsedUrl = parse_url($url);
+            $path = $parsedUrl['path'] ?? '';
+
+            // Remove leading slash
+            $path = ltrim($path, '/');
+
+            // Cloudinary URL patterns
+            $patterns = [
+                // Standard format: https://res.cloudinary.com/cloudname/image/upload/v1234567/folder/filename.jpg
+                '@/image/upload/(?:v\d+/)?(.+?)\.(jpg|jpeg|png|gif|webp)$@i',
+
+                // Alternative format: https://res.cloudinary.com/cloudname/image/upload/folder/filename.jpg
+                '@/upload/(?:v\d+/)?(.+?)\.(jpg|jpeg|png|gif|webp)$@i',
+
+                // Direct format: https://res.cloudinary.com/cloudname/folder/filename.jpg
+                '@^(?:image/upload/)?(?:v\d+/)?(.+?)\.(jpg|jpeg|png|gif|webp)$@i'
+            ];
+
+            foreach ($patterns as $pattern) {
+                if (preg_match($pattern, $path, $matches)) {
+                    $publicId = $matches[1];
+
+                    // Remove any transformation parts if present
+                    if (strpos($publicId, '/') !== false) {
+                        $parts = explode('/', $publicId);
+                        $publicId = end($parts);
+                    }
+
+                    return $publicId;
+                }
+            }
+
+            Log::warning('Could not extract public_id from URL: ' . $url);
             return null;
         } catch (\Exception $e) {
-            Log::error('Failed to extract public ID: ' . $e->getMessage());
+            Log::error('Failed to extract public_id from URL: ' . $e->getMessage());
             return null;
         }
     }

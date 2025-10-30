@@ -304,4 +304,35 @@ class ProjectController extends Controller
             return $this->respond('Failed to delete project', null, 500);
         }
     }
+
+    private function extractPublicIdFromUrl($url)
+    {
+        try {
+            if (empty($url)) {
+                return null;
+            }
+
+            $parsedUrl = parse_url($url);
+            $path = $parsedUrl['path'] ?? '';
+
+            $patterns = [
+                '/\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+                '/\/image\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/',
+                '/\/upload\/v\d+\/(.+)\.(jpg|jpeg|png|gif|webp)$/'
+            ];
+
+            foreach ($patterns as $pattern) {
+                if (preg_match($pattern, $path, $matches)) {
+                    return $matches[1];
+                }
+            }
+
+            Log::warning('Could not extract public_id from URL: ' . $url);
+            return null;
+        } catch (\Exception $e) {
+            Log::error('Failed to extract public_id from URL: ' . $e->getMessage());
+            return null;
+        }
+    }
+
 }
